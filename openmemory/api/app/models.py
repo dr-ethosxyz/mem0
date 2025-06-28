@@ -24,10 +24,26 @@ class MemoryState(enum.Enum):
     deleted = "deleted"
 
 
+class Organization(Base):
+    __tablename__ = "organizations"
+    id = Column(UUID, primary_key=True, default=lambda: uuid.uuid4())
+    organization_id = Column(String, nullable=False, unique=True, index=True)
+    name = Column(String, nullable=True)
+    created_at = Column(DateTime, default=get_current_utc_time, index=True)
+    updated_at = Column(
+        DateTime,
+        default=get_current_utc_time,
+        onupdate=get_current_utc_time,
+    )
+
+    users = relationship("User", back_populates="organization")
+
+
 class User(Base):
     __tablename__ = "users"
     id = Column(UUID, primary_key=True, default=lambda: uuid.uuid4())
     user_id = Column(String, nullable=False, unique=True, index=True)
+    organization_id = Column(UUID, ForeignKey("organizations.id"), nullable=False, index=True)
     name = Column(String, nullable=True, index=True)
     email = Column(String, unique=True, nullable=True, index=True)
     metadata_ = Column('metadata', JSON, default=dict)
@@ -36,8 +52,13 @@ class User(Base):
                         default=get_current_utc_time,
                         onupdate=get_current_utc_time)
 
+    organization = relationship("Organization", back_populates="users")
     apps = relationship("App", back_populates="owner")
     memories = relationship("Memory", back_populates="user")
+
+    __table_args__ = (
+        sa.UniqueConstraint('user_id', 'organization_id', name='idx_user_org'),
+    )
 
 
 class App(Base):

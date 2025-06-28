@@ -13,8 +13,16 @@ from app.utils.memory import get_memory_client
 
 from app.database import get_db
 from app.models import (
-    Memory, MemoryState, MemoryAccessLog, App,
-    MemoryStatusHistory, User, Category, AccessControl, Config as ConfigModel
+    Memory,
+    MemoryState,
+    MemoryAccessLog,
+    App,
+    MemoryStatusHistory,
+    User,
+    Category,
+    AccessControl,
+    Config as ConfigModel,
+    Organization,
 )
 from app.schemas import MemoryResponse, PaginatedMemoryResponse
 from app.utils.permissions import check_memory_access_permissions
@@ -92,10 +100,36 @@ def get_accessible_memory_ids(db: Session, app_id: UUID) -> Set[UUID]:
     return allowed_memory_ids
 
 
+def get_or_create_organization(db: Session, organization_id: str) -> Organization:
+    org = db.query(Organization).filter(Organization.organization_id == organization_id).first()
+    if not org:
+        org = Organization(organization_id=organization_id)
+        db.add(org)
+        db.commit()
+        db.refresh(org)
+    return org
+
+
+def get_or_create_user(db: Session, user_uuid: str, organization_id: str) -> User:
+    org = get_or_create_organization(db, organization_id)
+    user = (
+        db.query(User)
+        .filter(User.user_id == user_uuid, User.organization_id == org.id)
+        .first()
+    )
+    if not user:
+        user = User(user_id=user_uuid, organization_id=org.id)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    return user
+
+
 # List all memories with filtering
 @router.get("/", response_model=Page[MemoryResponse])
 async def list_memories(
-    user_id: str,
+    user_uuid: str,
+    organization_id: str,
     app_id: Optional[UUID] = None,
     from_date: Optional[int] = Query(
         None,
@@ -114,9 +148,7 @@ async def list_memories(
     sort_direction: Optional[str] = Query(None, description="Sort direction (asc or desc)"),
     db: Session = Depends(get_db)
 ):
-    user = db.query(User).filter(User.user_id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = get_or_create_user(db, user_uuid, organization_id)
 
     # Build base query
     query = db.query(Memory).filter(
@@ -173,12 +205,11 @@ async def list_memories(
 # Get all categories
 @router.get("/categories")
 async def get_categories(
-    user_id: str,
+    user_uuid: str,
+    organization_id: str,
     db: Session = Depends(get_db)
 ):
-    user = db.query(User).filter(User.user_id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = get_or_create_user(db, user_uuid, organization_id)
 
     # Get unique categories associated with the user's memories
     # Get all memories
@@ -195,7 +226,8 @@ async def get_categories(
 
 
 class CreateMemoryRequest(BaseModel):
-    user_id: str
+    user_uuid: str
+    organization_id: str
     text: str
     metadata: dict = {}
     infer: bool = True
@@ -208,9 +240,7 @@ async def create_memory(
     request: CreateMemoryRequest,
     db: Session = Depends(get_db)
 ):
-    user = db.query(User).filter(User.user_id == request.user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = get_or_create_user(db, request.user_uuid, request.organization_id)
     # Get or create app
     app_obj = db.query(App).filter(App.name == request.app,
                                    App.owner_id == user.id).first()
@@ -225,7 +255,9 @@ async def create_memory(
         raise HTTPException(status_code=403, detail=f"App {request.app} is currently paused on OpenMemory. Cannot create new memories.")
 
     # Log what we're about to do
-    logging.info(f"Creating memory for user_id: {request.user_id} with app: {request.app}")
+    logging.info(
+        f"Creating memory for user_id: {request.user_uuid} with app: {request.app}"
+    )
     
     # Try to get memory client safely
     try:
@@ -243,7 +275,7 @@ async def create_memory(
     try:
         qdrant_response = memory_client.add(
             request.text,
-            user_id=request.user_id,  # Use string user_id to match search
+            user_id=request.user_uuid,  # Use string user_uuid to match search
             metadata={
                 "source_app": "openmemory",
                 "mcp_client": request.app,
@@ -323,7 +355,8 @@ async def get_memory(
 
 class DeleteMemoriesRequest(BaseModel):
     memory_ids: List[UUID]
-    user_id: str
+    user_uuid: str
+    organization_id: str
 
 # Delete multiple memories
 @router.delete("/")
@@ -331,9 +364,7 @@ async def delete_memories(
     request: DeleteMemoriesRequest,
     db: Session = Depends(get_db)
 ):
-    user = db.query(User).filter(User.user_id == request.user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = get_or_create_user(db, request.user_uuid, request.organization_id)
 
     for memory_id in request.memory_ids:
         update_memory_state(db, memory_id, MemoryState.deleted, user.id)
@@ -344,11 +375,13 @@ async def delete_memories(
 @router.post("/actions/archive")
 async def archive_memories(
     memory_ids: List[UUID],
-    user_id: UUID,
+    user_uuid: str,
+    organization_id: str,
     db: Session = Depends(get_db)
 ):
+    user = get_or_create_user(db, user_uuid, organization_id)
     for memory_id in memory_ids:
-        update_memory_state(db, memory_id, MemoryState.archived, user_id)
+        update_memory_state(db, memory_id, MemoryState.archived, user.id)
     return {"message": f"Successfully archived {len(memory_ids)} memories"}
 
 
@@ -359,7 +392,8 @@ class PauseMemoriesRequest(BaseModel):
     all_for_app: bool = False
     global_pause: bool = False
     state: Optional[MemoryState] = None
-    user_id: str
+    user_uuid: str
+    organization_id: str
 
 # Pause access to memories
 @router.post("/actions/pause")
@@ -375,9 +409,7 @@ async def pause_memories(
     category_ids = request.category_ids
     state = request.state or MemoryState.paused
 
-    user = db.query(User).filter(User.user_id == request.user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = get_or_create_user(db, request.user_uuid, request.organization_id)
     
     user_id = user.id
     
@@ -461,7 +493,8 @@ async def get_memory_access_log(
 
 class UpdateMemoryRequest(BaseModel):
     memory_content: str
-    user_id: str
+    user_uuid: str
+    organization_id: str
 
 # Update a memory
 @router.put("/{memory_id}")
@@ -470,9 +503,7 @@ async def update_memory(
     request: UpdateMemoryRequest,
     db: Session = Depends(get_db)
 ):
-    user = db.query(User).filter(User.user_id == request.user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = get_or_create_user(db, request.user_uuid, request.organization_id)
     memory = get_memory_or_404(db, memory_id)
     memory.content = request.memory_content
     db.commit()
@@ -480,7 +511,8 @@ async def update_memory(
     return memory
 
 class FilterMemoriesRequest(BaseModel):
-    user_id: str
+    user_uuid: str
+    organization_id: str
     page: int = 1
     size: int = 10
     search_query: Optional[str] = None
@@ -497,9 +529,7 @@ async def filter_memories(
     request: FilterMemoriesRequest,
     db: Session = Depends(get_db)
 ):
-    user = db.query(User).filter(User.user_id == request.user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = get_or_create_user(db, request.user_uuid, request.organization_id)
 
     # Build base query
     query = db.query(Memory).filter(
@@ -589,14 +619,13 @@ async def filter_memories(
 @router.get("/{memory_id}/related", response_model=Page[MemoryResponse])
 async def get_related_memories(
     memory_id: UUID,
-    user_id: str,
+    user_uuid: str,
+    organization_id: str,
     params: Params = Depends(),
     db: Session = Depends(get_db)
 ):
     # Validate user
-    user = db.query(User).filter(User.user_id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = get_or_create_user(db, user_uuid, organization_id)
     
     # Get the source memory
     memory = get_memory_or_404(db, memory_id)
